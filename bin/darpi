@@ -1,0 +1,617 @@
+#!/usr/local/bin/perl
+#
+# @(#)perltool:darpi 1.45 01/26/00 11:29:39
+# 
+# Darpi - a pseudo mailing list server; its pseudo 'cause no system
+#	  alias is used. The actual list, as well as other related
+#	  files, are stored at $home/.darpi and $home/mail/$listdir. 
+#	  The script should be invoked by mail filter script which goes
+#	  like this:
+#		cat <message> | darpi -n <listdir> -o <owner home> 
+#	  Other options are:
+#		-b: base directory of the list, default is "$HOME/mail".
+#		-d: debugging mode.
+#		-f: remote printing message.
+#		-l: print out the list and exit.
+#		-s: maximun size of message allowed, default is 100K.
+#		-w: print out the list in html and exit.
+#
+#	  This script can also act as tpc-rp processor, to do so
+#	  a special list, say 'rp', should have existed and the subject
+#	  of rp message should look like:
+#		Subject: <rp> [to: foo, bar] whatever...
+#	  where foo (and bar) can be either a name, an alias, an e-mail
+#	  address or facsimile number (+ddd-ddd-dddd or just numbers).
+#	  And the script should be invoked with option `-f'.
+#
+# By Simon Yeh <syeh@csfcorp.com>, May 1995.
+#
+
+BEGIN {
+	unshift(@INC, "/home/syeh/lib/perl");
+}
+
+use strict;
+use vars qw($opt_b $opt_d $opt_f $opt_l $opt_n $opt_o $opt_s $opt_w);
+use Getopt::Std;
+use Mail::Address;
+use MIME::Head;
+use MIME::Entity;
+use MIME::Parser;
+use Rolo::List;
+use Flocker;
+use Alert::Atom;
+use Alert::List;
+use Converter::Toolbox;
+use Converter::Conversion;
+
+getopts('b:dfln:o:s:w');
+
+(my $prog = $0) =~ s|.*/||;
+my $usage = 
+      "Usage: $prog [-dflw] [-b base] -n listdir -o homedir [-s max_size]\n";
+my $listdir = $opt_n || die $usage;
+my $home =    $opt_o || die $usage;
+my $basedir = $opt_b || "$home/mail";
+my $debug =   $opt_d;
+my $rp =      $opt_f;
+my $fsize =   $opt_s || 100000;
+
+# defaults
+my $base     = "$basedir/$listdir";
+my $darpidir = "$home/.darpi";
+my $cvtdefs  = "$darpidir/converter";
+my $SENDMAIL = "/usr/lib/sendmail";
+
+# temporary files...
+my $TMP	      = "/tmp/$prog$$";
+
+$ENV{'PATH'} .= "/bin:/usr/bin:/usr/local/bin:/usr/ucb";
+
+my $FORM = "$base/form.";
+
+my $rolo = new Rolo::List($base, $darpidir);
+
+die "gibberish in $base?" unless $rolo;
+
+if ($opt_l) {
+	$rolo->printlist();
+	exit 0;
+}
+
+if ($opt_w) {
+	$rolo->printhtmllist();
+	exit 0;
+}
+
+my @obsid;
+my %glist =      %{$rolo->{list}};
+my @gid =        @{$rolo->{gid}};
+my $ownerentry = ${$rolo->{ownerentry}};
+my ($time, $current);
+
+{
+	my @ltime = localtime(time());
+	my ($s,$m,$h,$dd,$mm,$yy) = @ltime[0..5];
+	$time = sprintf("%02d%02d%02d %02d:%02d:%02d",$yy % 100,$mm+1,$dd,$h,$m,$s);
+
+	# as if this script will be around for a centry to come?
+	$yy += 1900;
+	$current = $yy . sprintf("Q%1d", int($mm/3)+1);
+}
+
+my $archive = "$base/archive/$current";
+
+mkdir $TMP, 0755 unless -d $TMP;
+
+my $parser = new MIME::Parser;
+$parser->output_dir("$TMP");
+my $top_entity = $parser->read(\*STDIN);
+
+exit 0 if (!$top_entity);
+ 
+my $header = $top_entity->head;
+my $subject = $header->get('Subject');
+$subject =~ s/.*<$rolo->{name}>\s*//;
+$subject =~ y/A-Z/a-z/;
+ 
+my ($from, $email, $name, $oname, $dupname);
+for (qw(reply-to from sender return-path))
+{
+    my $field = $header->get($_);
+    next unless $field;
+    ($from) = Mail::Address->parse($field);
+    next unless $from;    
+    my $a = $from->address;
+    if ($a)
+    {
+      	$email = $a;
+      	# will see if the name is correctly parsed?
+      	$name = $from->name;
+      	last;
+    }
+}
+
+my ($newentry, $entry, $action, $topic, $form);
+my @efax;
+
+($entry, $email, $oname) = $rolo->lookup($email, $name);
+
+my $dest = $debug ? $rolo->{owner} : $email;
+
+my @parts = ();
+my @entities = ($top_entity);
+while ($_ = shift(@entities)) {
+	my @p;
+	if (@p = $_->parts) {
+		unshift @entities, @p;
+	} else {
+		push @parts, $_;
+	}
+}
+
+my %converters = undef;
+
+$_ = $subject;
+ACTION: {
+	if ($rp) {
+		unless (/\[to:([^\]]*)\](.*)/) {
+			reply($dest, 0, 
+			      "no rp recipient specified", 
+			      "You didn't specify rp recipient as the\n" .
+			      "acceptable form in the subject line, like:\n" .
+			      "    Subject: <$rolo->{name}> [to:recipient]\n" .
+			      "Please resend it with recipient(s) " .
+			      "specified.\n");
+
+			print qq($time rp mesg from "$email" has no recipient\n);
+			last ACTION;
+		}
+		$action = 'rp';
+		my @rp_dest = split(',', $1);
+		my $recipient;
+		my @unknown;
+		foreach $recipient (@rp_dest) {
+			# remove possible leading and trailing blanks.
+                        $recipient =~ s/^\s*//;
+                        $recipient =~ s/\s*$//;
+			my $ep = $rolo->rplookup($recipient);
+			my $faxnum = $ep->rp_to(0);
+			if ($ep && $faxnum) {
+				push(@efax, $faxnum);
+			} else {
+				push(@unknown, $recipient);
+			}
+		}
+		if (@unknown) {
+			reply($dest, 0, 
+				"unknown rp recipient(s)", 
+				"I don't know the following recipient(s)'s fax number:\n\t" .
+			        join(',', @unknown) . "\n");
+		}
+		last ACTION;
+	}
+	if (/((add|change)me)/) {
+		$action = $1;
+		$newentry = new Rolo::Entry();
+
+		$newentry->store('E-Mail', $email);
+		$newentry->store('Name', $name) if $name;
+
+		my $ph = $parts[0]->bodyhandle->open("r");
+		my @lines = $ph->getlines;
+
+		# see what we got here...
+		$newentry->parsemsg(join ("", @lines));
+
+		# issue a warning if they don't match?
+		#$newentry->store('E-Mail', $email);
+
+		if ($entry) {
+			$dupname = $rolo->modify($newentry, $entry);
+                        $form = $rolo->{update};
+                        $topic = "Confirmation from $rolo->{name} server";
+                	$rolo->updatelist(0);
+		} else {
+			$dupname = $rolo->add($newentry, $oname);
+			$form = $rolo->{hello};
+                        $topic = "Wellcome to $rolo->{name} List";
+                	$rolo->updatelist(0, $newentry->{'ID'});
+			$entry = $newentry;
+		}
+		# sanction the "official" name.
+		$oname = $entry->{'Name'};
+                last ACTION;
+	}
+	if (/(deleteme)/) {
+		die "$time \"$email\" attempted to $_\n" unless $entry;
+		$action = $1;
+		$rolo->delete($entry);
+                $rolo->updatelist(1);
+                $form = $rolo->{bye};
+                $topic = "You have been removed from $rolo->{name} List";
+                last ACTION;
+        }
+        if (/(get(ps|postscript))/) {
+		$action = $1;
+		%converters = Converter::Toolbox::loadconverters($cvtdefs)
+					unless %converters;
+		last ACTION;
+	}
+	if (/(get(gb|big5|bg))/) {
+		$action = $1;
+		last ACTION;
+	}
+	if (/((get|set)alert)/) {
+		$action = $1;
+		die "$time \"$email\" attempted to $_\n" unless $entry;
+
+		my $uslist = new Alert::List('/home/syeh/www/docs/stock');
+		my $twlist = new Alert::List('/home/syeh/www/docs/twstock');
+
+		my $mesg;
+
+		if ($action eq  'setalert') {
+			my (%usalerts, %twalerts);
+			my ($remarks, $edit);
+
+			my $ph = $parts[0]->bodyhandle->open("r");
+			for ($ph->getlines) {
+				chop;
+				next if /^$/;
+				if (/^#/) {
+					$remarks .= $_;
+					next;
+				}
+				s/\s//g;
+				s/^([+-])//;
+				$edit = ($1 eq '-') ? '-' : '+';
+				my ($ticker, @items) = split(/:/);
+				$remarks =~ s/^#//;
+				@items[4..7] = (undef, undef, $remarks, $edit);
+				if ($ticker =~ /^\d/) {
+					$twalerts{$ticker} = new Alert::Atom(@items);
+				} else {
+					$usalerts{$ticker} = new Alert::Atom(@items);
+				}
+				undef $remarks;
+			}
+
+			if (%usalerts) {
+				$uslist->update_alerts($email, \%usalerts);
+				$uslist->dump_alerts();
+			}
+			if (%twalerts) {
+				$twlist->update_alerts($email, \%twalerts);
+				$twlist->dump_alerts();
+			}
+		} else {
+			$action =~ s/get/got/;
+		}
+
+		$mesg .= $uslist->print_alerts($email) if $uslist;
+		$mesg .= $twlist->print_alerts($email) if $twlist;
+		if ($mesg) {
+			$topic = "($rolo->{name}) Alert Listing for $email";
+			reply($dest, 0, $topic, Alert::Atom::legend() . "\n\n" . $mesg);
+		} else {
+			$topic = "No Alerts Registered for $email";
+			reply($dest, 0, $topic, 
+				"There is no alerts registered from $email, sorry.\n");
+		}
+
+		print qq($time "$email" $action\n);
+		$action = 0;
+		last ACTION;
+	}
+	if (/(get(archive|list|htmllist|help))/) {
+		$action = $1;
+		if ($rolo->{policy} == 0) {
+			die "$time \"$email\" attempted to $_\n" unless $entry;
+		}
+
+		if ($action eq 'gethelp') {
+			$form = $rolo->{hello};
+                        $topic = "$rolo->{name} List Instruction";
+		} elsif ($action eq 'getarchive') {
+			my (@arlist, @yesarlist, @noarlist);
+			if (/getarchive (.+)/) {
+                        	(my $string = $1) =~ s/\s+//g;
+				$string =~ y/a-z/A-Z/;
+				@arlist = split(',', $string);
+			} else {
+				push(@arlist, $current);
+			}
+			my ($arch, $catcmd);
+			LOOP: foreach $arch (@arlist) {
+				my $archpath = "$base/archive/$arch";
+				if (! -e $archpath && ! -e $archpath.'.gz') {
+					push(@noarlist, $arch);
+					next LOOP;
+				}
+				
+				# assume its readable.
+				$catcmd = -e $archpath.'.gz' ? 
+					"gunzip -c $archpath.gz" : "cat $archpath";
+				my $tmparch = "$TMP/$arch";
+				push(@yesarlist, $tmparch);
+				system qq($catcmd > $tmparch);
+			}
+			if (@noarlist) {
+		                $topic = "No such archive(s) in $rolo->{name} List";
+				reply($dest, 0, $topic, 
+					"Archive(s) " . join(" ", @noarlist) . 
+					" does not exist.\n");
+			}
+			if (@yesarlist) {
+				send_files($dest, 
+					"$rolo->{name} Archive", 
+					$rolo->{note}, @yesarlist);
+				map { unlink $_ } @yesarlist;
+			}
+		} else {
+			my $MESG = "$TMP/mesg$$";
+			open(SAVEOUT, ">&STDOUT");
+			open(STDOUT, ">$MESG") || die "can't redirect to $MESG";
+			if ($action eq 'getlist') {
+				$rolo->printlist();
+				$topic = "$rolo->{name} List";
+			} else {
+				$rolo->printhtmllist();
+				$topic = "$rolo->{name} List in html";
+			}
+			close STDOUT;
+			open(STDOUT, ">&SAVEOUT");
+			open(MESG, "<$MESG") || die "can't open $MESG";
+			reply($dest, 0, $topic, join("", <MESG>));
+			unlink $MESG;
+		}
+		$action =~ s/get/got/;
+		print qq($time "$email" $action\n);
+		$action = 0 if $action ne 'gothelp';
+                last ACTION;
+        }
+        # none above
+        $action = "broadcast";
+	if ($rolo->{policy} == 0) {
+		die qq($time "$email" attempted to $action\n) unless $entry;
+	}
+}
+
+exit 0 if (! $action);
+
+if ($action ne 'broadcast' && $action ne 'rp') {
+	my ($dupnote, $formletter, $profile);
+	if ($dupname) {
+		$dupnote = '-' x 80;
+		$dupnote .= qq(\nThe name, "$dupname", which you registered );
+		$dupnote .= qq(is already been registered.\n);
+		$dupnote .= qq("$oname" is used instead. You can change );
+		$dupnote .= qq(it later with "ChangeMe" command.\n);
+		$dupnote .= '-' x 80;
+		$dupnote .= "\n";
+	}
+        open(F, "<$form") || die "Can't open $form: $!\n";;
+	$formletter = join("", <F>);
+	if ($action ne "deleteme") {
+		$profile = $entry->pretty_prt();
+	}
+	reply($dest, $entry->{'Alias'} || $oname || "there", $topic,
+		$dupnote . $formletter . $profile);
+	$action =~ s/e?me$/ed/;
+	print qq($time "$email" $action\n);
+	exit 0;
+#} elsif (!$header->get('content-length') or !$parts[0]->bodyhandle) {
+#	my $mesgid = $header->get('Message-Id');
+#	reply($dest, 0, "no message to send",
+#		"Your message $mesgid was not broadcasted since its empty.\n");
+#	exit 0;
+}
+
+my $sendtomyself = ($entry == $ownerentry); 
+my @request = $subject =~ /\[([^\]]*)\]/g;
+my $offtherecord = grep(/^otr|off the record$/, @request);
+
+my @bcc = @{$rolo->{bcc}};
+if ($action ne 'rp') {
+	my %saw = ();
+	my @excc;
+	@excc = ( $email );
+	@saw{@excc} = (1) x @excc;
+	@bcc = grep !$saw{$_}, @bcc;
+	@efax = @{$rolo->{fax}};
+}
+
+my @faxparts = ();
+my $faxlength = 0;
+my $origheader;
+
+$top_entity->sync_headers(Length=>'COMPUTE');
+
+if (@bcc || $action eq 'rp') {
+
+	if (!$offtherecord && ($action ne 'rp')) {
+		system "gunzip $archive.gz" if (-e $archive.'.gz');
+		open(A, ">>$archive") || die("Can't open $archive: $!\n");
+		flocker(\*A, $LOCK_EX);
+		print A "From $email ", scalar localtime, "\n";
+		$top_entity->print(\*A);
+		print A "\n\n";
+		flocker(\*A, $LOCK_UN);
+		close A;
+		system "gzip $archive";
+	}
+
+	if ($debug) {
+		open(M, ">$TMP/debug.b$$") || die "can't write to $TMP/debug.b$$";
+	} elsif ($action eq 'rp') {
+		# kludge to just process the faxfiles.
+		open(M, ">/dev/null") || die "can't write to /dev/null";
+	} else {
+		open(M, "|$SENDMAIL -t") || die "can't pipe to sendmail";
+	}
+
+	# explicitely turn reformatting on
+	# <there is a bug in Mail::Header.pm that incorrectly format 
+	# the header line>
+	# $header->Mail::Header::modify(1);
+	$origheader = $header->original_text;
+	for (qw(sender to cc error-to reply-to x-lines return-receipt-to))
+	{
+		$header->delete($_);
+	}
+	$header->add('Sender', "$rolo->{name} List <$rolo->{owner}>");
+
+	# I refuse to send to myself
+	#	...but of course I can prefix myself with '\' to 
+	#	prevent aliasing.
+	$header->add('To', $sendtomyself ? pop(@bcc) : $email);
+	$header->add('Bcc', join(',', @bcc));
+	$header->add('Reply-To', $rolo->{owner});
+	$header->add('X-Comment',
+		"Do-it-yourself List Services:");
+	$header->add('X-Comment', 
+		" \tAddMe|ChangeMe|DeleteMe", -1);
+	$header->add('X-Comment', 
+		" \tGetList|GetHtmlList|GetArchive|GetHelp", -1);
+	$header->add('X-Comment', 
+		" \tGetAlert|SetAlert", -1) if $rolo->{pig};
+	# $header->add('X-Comment', 
+	#	"GetPostscript|GetBig5|GetGB", -1);
+
+	$top_entity->sync_headers(Length=>'COMPUTE');
+	
+	$top_entity->print(\*M);
+	close M;
+	die "print mail message failed: $!" if $? >>8;
+
+	$header->delete('Bcc');
+	$header->delete('X-Comment');
+	$header->delete('Received');
+
+	my %rp_ctype = ('text/plain', 1, 
+			'message/rfc822', 1,
+			'application/postscript', 1,
+			'image/tiff', 1);
+	my ($part, $fsize);
+	foreach $part (@parts) {
+		my $file = $part->bodyhandle->path;
+		if ($rp_ctype{$part->mime_type} 
+				&& -s $file) {
+			push(@faxparts, $part);
+			$fsize = $part->head->get('content-length') 
+					|| (stat $file)[7];
+			$faxlength += $fsize;
+		} else {
+			# send a friendly reply? 
+		} 
+	}
+}
+
+if ($action ne 'rp') {
+	print qq($time mesg from "$email"\n);
+}
+
+my @cvtparts;
+if ($faxlength < $fsize && @efax && @faxparts) {
+	my $efaxref = mkentity(pop(@efax), $header->get('Subject'));
+	my $efaxhd = $$efaxref->head;
+	$efaxhd->add('bcc', join(',', @efax)) if @efax;
+
+	my $info = $ownerentry->rp_cover(0) . "\n";
+	if ($action ne 'rp') {
+		$info .= "Original RFC822 header:\n" .
+			 '=' x 75 . "\n" .
+			 $origheader . "\n" .
+			 '=' x 75 . "\n";
+	}
+	attach $$efaxref Data => $info;
+
+	# load converters...
+	%converters = Converter::Toolbox::loadconverters($cvtdefs)
+				unless %converters;
+
+	ConvertMime(\@faxparts, \%converters) if %converters;
+
+	if ($top_entity->is_multipart) {
+		map { $$efaxref->add_part($_); } @faxparts;
+	} else {
+		my ($spart, %attrs);
+		$attrs{Path}     = $faxparts[0]->bodyhandle->path;
+		$attrs{Type}     = $faxparts[0]->mime_type;
+		$attrs{Encoding} = $faxparts[0]->head->mime_encoding
+					if $faxparts[0]->head->mime_encoding;
+		attach $$efaxref ( %attrs );
+	}
+
+	$$efaxref->sync_headers(Length=>'COMPUTE');
+
+	my $cmd = $debug ? ">$TMP/debug.f$$" : "|$SENDMAIL -oi -t";
+	open(M, $cmd) || die "$cmd failed: $!";
+	$$efaxref->print(\*M);
+	close M;
+	warn "$cmd failed: $!" if $? >>8;
+
+	print qq($time forward rp mesg from "$email"\n) if ($action eq 'rp');
+}
+
+exit 0;
+
+sub mkentity {
+	my ($to, $subj, $onebody) = @_;
+	my $top = build MIME::Entity
+			-From => $rolo->{owner},
+			-To => $to,
+			-Sender => "$rolo->{name} List <$rolo->{owner}>",
+			-Subject => $subj,
+			$onebody ?
+			( Data => $onebody ) :
+			( Type => "multipart/mixed" ) 
+			;
+	return \$top;
+}
+
+sub send_files {
+	my $to = shift;
+	my $subj = shift;
+	my $topref = mkentity($to, $subj);
+	for (@_) {
+		attach $$topref Path => $_,
+			    Type => "text/plain",
+			    Encoding => "quoted-printable";
+	} 
+	sendmesg($topref);
+}
+
+sub reply {
+	my ($to, $man, $subj, $body) = @_;
+
+	if ($man) {
+		# fix messages
+		$_ = $body;
+	        s/_NAME_/$man/g;
+	        s/_ADDRESS_/$rolo->{owner}/g;
+	        s/_LIST_/$rolo->{name}/g;
+	        s/_SIGNATURE_/$rolo->{signature}/g;
+		$body = $_;
+	}
+
+	my $topref = mkentity($to, $subj, $body);
+	sendmesg($topref);
+}
+
+sub sendmesg {
+	my $msgref = shift;
+
+	open(SENDMAIL, "|$SENDMAIL -oi -t") || die "$SENDMAIL: $!";
+	$$msgref->print(\*SENDMAIL);
+	close SENDMAIL;
+	warn "$SENDMAIL: $!" if $? >>8;
+}
+
+END {
+	exit 0 if $debug;
+	map { $_->purge; } @parts;
+    	map { $_->purge; } @cvtparts;
+	system "rm -rf $TMP" if -d $TMP;
+}
