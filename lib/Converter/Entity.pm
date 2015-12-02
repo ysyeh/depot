@@ -13,7 +13,7 @@ use Carp;
 
 my %fields = (
 	type	=> undef,	# content-type	
-	attrs	=> undefr,	# content-type attributes; a hash reference
+	attrs	=> undef,	# content-type attributes; a hash reference
 	module	=> undef,	# package to be loaded
 	cvtfunc	=> undef,	# converter wrapper subroutine to be called
 	cvtexec	=> undef,	# path of external converter
